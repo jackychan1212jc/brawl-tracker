@@ -1,25 +1,26 @@
 import os
 import requests
+import traceback
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from supabase import create_client, Client
 
 app = FastAPI()
 
-# 1. 從 Render 的「環境變數保險箱」讀取機密資料 (絕對安全)
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-BRAWL_API_TOKEN = os.environ.get("BRAWL_API_TOKEN", "")
-PLAYER_TAGS_STR = os.environ.get("PLAYER_TAGS", "#你的標籤")
+# 自動清除變數前後可能不小心複製到的隱形空白
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+BRAWL_API_TOKEN = os.environ.get("BRAWL_API_TOKEN", "").strip()
+PLAYER_TAGS_STR = os.environ.get("PLAYER_TAGS", "#你的標籤").strip()
 PLAYER_TAGS = [tag.strip() for tag in PLAYER_TAGS_STR.split(",")]
 
-# 2. 啟動 Supabase 雲端資料庫連線
+error_detail = ""
 try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-except:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
     supabase = None
+    error_detail = traceback.format_exc() # 抓取最底層的錯誤原因
 
-# 3. 戰績爬蟲與寫入資料庫的邏輯
 def update_brawl_data():
     if not supabase or not BRAWL_API_TOKEN:
         return
@@ -28,7 +29,6 @@ def update_brawl_data():
     
     for tag in PLAYER_TAGS:
         tag_formatted = tag.replace("#", "%23")
-        # 使用防擋代理網址，完美繞過 Render 動態 IP 被鎖的問題
         url = f"https://bsproxy.royaleapi.dev/v1/players/{tag_formatted}/battlelog"
         
         response = requests.get(url, headers=headers)
@@ -38,19 +38,18 @@ def update_brawl_data():
         battles = response.json().get("items", [])
         for battle in battles:
             battle_time = battle.get("battleTime")
-            
-            # 檢查這筆戰績是否已經存在？(存在就跳過，避免重複)
-            existing = supabase.table("battlelog").select("id").eq("battle_time", battle_time).eq("account", tag).execute()
-            if len(existing.data) > 0:
+            try:
+                existing = supabase.table("battlelog").select("id").eq("battle_time", battle_time).eq("account", tag).execute()
+                if len(existing.data) > 0:
+                    continue
+            except:
                 continue
                 
-            # 解析戰績細節
             b = battle.get("battle", {})
             event = battle.get("event", {})
             my_brawler = ""
             brawler_trophies = ""
             
-            # 找出自己使用的英雄
             players_list = []
             if "teams" in b:
                 for team in b["teams"]:
@@ -63,7 +62,6 @@ def update_brawl_data():
                     my_brawler = player.get("brawler", {}).get("name", "")
                     brawler_trophies = str(player.get("brawler", {}).get("trophies", ""))
 
-            # 寫入 Supabase
             new_record = {
                 "account": tag,
                 "battle_time": battle_time,
@@ -75,18 +73,34 @@ def update_brawl_data():
                 "result": b.get("result", "draw"),
                 "trophy_change": str(b.get("trophyChange", 0))
             }
-            supabase.table("battlelog").insert(new_record).execute()
+            try:
+                supabase.table("battlelog").insert(new_record).execute()
+            except:
+                pass
 
-# 4. 網頁主畫面 (暗黑電競面板)
 @app.get("/")
 def read_root():
+    # 如果資料庫連線失敗，印出完整的診斷報告
     if not supabase:
-        return HTMLResponse("<h1 style='color:white; background:black;'>請先在 Render 設定環境變數 (Environment Variables)！</h1>")
+        html = f"""
+        <body style='background:black; color:white; font-family:sans-serif; padding:20px;'>
+            <h1 style='color:#ff4444;'>⚠️ 連線失敗，啟動除錯報告</h1>
+            <p><b>URL 讀取長度:</b> {len(SUPABASE_URL)} (如果為 0，代表 Render 沒傳遞到這個變數)</p>
+            <p><b>KEY 讀取長度:</b> {len(SUPABASE_KEY)} (如果為 0，代表 Render 沒傳遞到這個變數)</p>
+            <p><b>目前讀取到的 URL:</b> {SUPABASE_URL}</p>
+            <h3>⛔ 詳細錯誤日誌：</h3>
+            <pre style='color:#ffff00; background:#222; padding:15px; border-radius:5px; overflow-x:auto;'>{error_detail}</pre>
+        </body>
+        """
+        return HTMLResponse(content=html)
         
-    # 從資料庫抓取最新的 20 筆戰績顯示
-    res = supabase.table("battlelog").select("*").order("battle_time", desc=True).limit(20).execute()
-    data = res.data
-    
+    try:
+        res = supabase.table("battlelog").select("*").order("battle_time", desc=True).limit(20).execute()
+        data = res.data
+    except Exception as e:
+        return HTMLResponse(f"<h1 style='color:white; background:black;'>資料表讀取失敗: {str(e)}<br>請確認 Supabase 裡面是否真的有建立 battlelog 資料表？</h1>")
+        
+    # 如果成功，顯示正常的主控台介面
     html = """
     <html>
     <head>
@@ -127,8 +141,7 @@ def read_root():
     html += "</table></body></html>"
     return HTMLResponse(content=html)
 
-# 5. 手動觸發更新的網址
 @app.get("/update")
 def trigger_update(background_tasks: BackgroundTasks):
     background_tasks.add_task(update_brawl_data)
-    return {"message": "✅ 爬蟲已在背景啟動！正在去 Supercell 抓資料並寫入 Supabase 資料庫，請關閉此頁面，等 5 秒後重整首頁。"}
+    return {"message": "✅ 爬蟲已在背景啟動！正在去抓資料並寫入，請關閉此頁面，等 5 秒後重整首頁。"}
